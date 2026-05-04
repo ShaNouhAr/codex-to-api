@@ -1,0 +1,77 @@
+# Déploiement : copier .env puis lancer
+#   cp .env.example .env   # éditer OPENAI_COMPAT_API_KEY
+#   sudo docker compose up -d
+#
+# API (LAN) : http://<hôte>:8001/v1  — Bearer = OPENAI_COMPAT_API_KEY (voir .env)
+# Passerelle (8001 publié) → codex_openai_server (réseau interne) : corrige l’historique
+# assistant (bug input_text sur /responses, 400 au 2ᵉ tour de chat).
+# codex-openai : https://github.com/joshuasundance-swca/codex_openai_server
+services:
+  codex:
+    image: node:22-bookworm-slim
+    container_name: codex-to-api-codex
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - ./data/codex:/root/.codex
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      PATH: /usr/local/bin:/usr/local/sbin:/usr/bin:/bin
+      CODEX_HOME: /root/.codex
+    command: >
+      sh -c "
+        apt-get update -qq &&
+        apt-get install -y -qq ca-certificates >/dev/null &&
+        npm install -g @openai/codex@latest &&
+        exec tail -f /dev/null
+      "
+    restart: unless-stopped
+
+  codex-openai-core:
+    image: ghcr.io/joshuasundance-swca/codex_openai_server:v0.1.0
+    container_name: codex-to-api-openai-core
+    # auth.json est créé par le conteneur codex (root, souvent mode 600) : l’utilisateur
+    # « app » de l’image ne peut pas le lire. root ici = lecture seule du volume (réseau privé).
+    user: "0:0"
+    pull_policy: missing
+    expose:
+      - "8001"
+    environment:
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:?Créer un fichier .env avec OPENAI_COMPAT_API_KEY= (voir .env.example)}
+      OPENAI_COMPAT_HOST: "0.0.0.0"
+      OPENAI_COMPAT_PORT: "8001"
+      CODEX_HOME: /home/app/.codex
+      OPENAI_COMPAT_LOG_LEVEL: ${OPENAI_COMPAT_LOG_LEVEL:-INFO}
+      OPENAI_COMPAT_LOG_FORMAT: ${OPENAI_COMPAT_LOG_FORMAT:-text}
+      OPENAI_COMPAT_DEBUG_LOGGING: ${OPENAI_COMPAT_DEBUG_LOGGING:-false}
+      OPENAI_COMPAT_LOG_PAYLOADS: ${OPENAI_COMPAT_LOG_PAYLOADS:-false}
+    volumes:
+      - ./data/codex:/home/app/.codex:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  codex-openai:
+    build: ./gateway
+    container_name: codex-to-api-openai
+    depends_on:
+      codex-openai-core:
+        condition: service_healthy
+    environment:
+      UPSTREAM_URL: http://codex-openai-core:8001
+      OPENAI_COMPAT_API_KEY: ${OPENAI_COMPAT_API_KEY:?Créer un fichier .env avec OPENAI_COMPAT_API_KEY= (voir .env.example)}
+    ports:
+      - "0.0.0.0:8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
