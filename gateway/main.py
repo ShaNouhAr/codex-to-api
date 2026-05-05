@@ -13,6 +13,7 @@ Fonctionnalités :
   - Détection automatique des modèles Codex au démarrage
   - Rafraîchissement périodique du cache des modèles
   - Proxy transparent avec streaming pour /chat/completions et /responses
+  - Charset UTF-8 explicite sur les réponses JSON et SSE (accents côté client)
 """
 from __future__ import annotations
 
@@ -40,6 +41,8 @@ _STRIP_RESPONSES_UPSTREAM: frozenset[str] = frozenset(
     {"temperature", "prompt_cache_retention", "max_output_tokens"}
 )
 _STRIP_CHAT_ONLY: frozenset[str] = frozenset({"max_tokens", "max_completion_tokens"})
+
+JSON_UTF8 = "application/json; charset=utf-8"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -225,6 +228,29 @@ def bearer_headers(request: Request) -> dict[str, str]:
     return {"Authorization": auth} if auth else {}
 
 
+def upstream_json_content_type(request: Request) -> str:
+    """Corps JSON vers le core : toujours annoncer UTF-8 pour ``application/json`` (bytes déjà UTF-8)."""
+    ct = request.headers.get("content-type") or JSON_UTF8
+    if ct.split(";")[0].strip().lower() == "application/json":
+        return JSON_UTF8
+    return ct
+
+
+def response_media_type_with_charset(media_type: str | None, *, streaming: bool) -> str:
+    """Réponses au client : annoncer UTF-8 pour JSON et SSE (accents dans le corps / les deltas)."""
+    if not media_type:
+        return "text/event-stream; charset=utf-8" if streaming else JSON_UTF8
+    m = media_type.strip()
+    base = m.split(";")[0].strip().lower()
+    if "charset=" in m.lower():
+        return m
+    if base == "application/json":
+        return JSON_UTF8
+    if base == "text/event-stream":
+        return "text/event-stream; charset=utf-8"
+    return m
+
+
 async def proxy_upstream(
     method: str,
     path: str,
@@ -235,11 +261,9 @@ async def proxy_upstream(
     extra_headers: dict[str, str] | None = None,
 ) -> Response | StreamingResponse:
     """Generic proxy: send *method* + *path* to upstream, handle stream/non-stream."""
-    headers = {
-        **bearer_headers(request),
-        "Content-Type": request.headers.get("content-type", "application/json"),
-        **(extra_headers or {}),
-    }
+    extra = dict(extra_headers or {})
+    ct = extra.pop("Content-Type", None) or upstream_json_content_type(request)
+    headers = {**bearer_headers(request), **extra, "Content-Type": ct}
 
     client = httpx.AsyncClient(timeout=PROXY_TIMEOUT)
     try:
@@ -254,7 +278,11 @@ async def proxy_upstream(
         sc, ct = r.status_code, r.headers.get("content-type")
         await r.aclose()
         await client.aclose()
-        return Response(content=content, status_code=sc, media_type=ct)
+        return Response(
+            content=content,
+            status_code=sc,
+            media_type=response_media_type_with_charset(ct, streaming=False),
+        )
 
     async def body_iter() -> Any:
         try:
@@ -264,10 +292,11 @@ async def proxy_upstream(
             await r.aclose()
             await client.aclose()
 
+    stream_mt = r.headers.get("content-type", "text/event-stream")
     return StreamingResponse(
         body_iter(),
         status_code=r.status_code,
-        media_type=r.headers.get("content-type", "text/event-stream"),
+        media_type=response_media_type_with_charset(stream_mt, streaming=True),
         headers={
             k: v
             for k, v in r.headers.items()
@@ -286,7 +315,7 @@ async def health() -> Response:
     return Response(
         content=r.content,
         status_code=r.status_code,
-        media_type=r.headers.get("content-type"),
+        media_type=response_media_type_with_charset(r.headers.get("content-type"), streaming=False),
     )
 
 
@@ -294,14 +323,14 @@ async def health() -> Response:
 async def models(request: Request) -> Response:
     """Return models from cache (instant) or proxy upstream as fallback."""
     if _cached_models:
-        content = json.dumps(_cached_models).encode("utf-8")
-        return Response(content=content, status_code=200, media_type="application/json")
+        content = json.dumps(_cached_models, ensure_ascii=False).encode("utf-8")
+        return Response(content=content, status_code=200, media_type=JSON_UTF8)
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.get(f"{UPSTREAM}/v1/models", headers=bearer_headers(request))
     return Response(
         content=r.content,
         status_code=r.status_code,
-        media_type=r.headers.get("content-type"),
+        media_type=response_media_type_with_charset(r.headers.get("content-type"), streaming=False),
     )
 
 
