@@ -9,6 +9,7 @@ Réf. discussions sur erreurs 400 « Invalid Responses API request » / format d
 
 Fonctionnalités :
   - Correction automatique des messages assistant (content list → string)
+  - Retrait des paramètres refusés par l’API Responses Codex (temperature, max_tokens, etc.)
   - Détection automatique des modèles Codex au démarrage
   - Rafraîchissement périodique du cache des modèles
   - Proxy transparent avec streaming pour /chat/completions et /responses
@@ -32,6 +33,13 @@ UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8001").rstrip("/")
 MODEL_REFRESH_SECONDS = int(os.environ.get("MODEL_REFRESH_SECONDS", "300"))
 INTERNAL_API_KEY = os.environ.get("OPENAI_COMPAT_API_KEY", "")
 PROXY_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
+
+# Champs que ``/backend-api/codex/responses`` refuse souvent (unknown_parameter), alors que
+# codex_openai_server les relaie depuis chat ou /v1/responses — cf. codex-lb #128.
+_STRIP_RESPONSES_UPSTREAM: frozenset[str] = frozenset(
+    {"temperature", "prompt_cache_retention", "max_output_tokens"}
+)
+_STRIP_CHAT_ONLY: frozenset[str] = frozenset({"max_tokens", "max_completion_tokens"})
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -150,6 +158,15 @@ def parse_json_body(raw: bytes) -> Any:
         return json.loads(raw.decode("cp1252"))
     except UnicodeDecodeError:
         return json.loads(raw.decode("latin-1"))
+
+
+def strip_upstream_unsupported(d: dict[str, Any], *, chat: bool) -> None:
+    """Retire les paramètres incompatibles avec l’API Responses Codex en amont."""
+    for k in _STRIP_RESPONSES_UPSTREAM:
+        d.pop(k, None)
+    if chat:
+        for k in _STRIP_CHAT_ONLY:
+            d.pop(k, None)
 
 
 def fix_chat_messages(messages: list[Any]) -> list[Any]:
@@ -276,6 +293,7 @@ async def chat_completions(request: Request):
         stream = bool(data.get("stream"))
         if isinstance(data.get("messages"), list):
             data["messages"] = fix_chat_messages(data["messages"])
+        strip_upstream_unsupported(data, chat=True)
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
     except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
         pass
@@ -293,6 +311,7 @@ async def responses(request: Request):
         data = parse_json_body(raw)
         if isinstance(data, dict):
             stream = bool(data.get("stream"))
+            strip_upstream_unsupported(data, chat=False)
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
     except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
         pass
