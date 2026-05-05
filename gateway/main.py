@@ -131,6 +131,27 @@ app = FastAPI(title="codex-to-api chat gateway", version="2.0.0", lifespan=lifes
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def parse_json_body(raw: bytes) -> Any:
+    """
+    Parse un corps JSON en acceptant des encodages clients incorrects.
+
+    ``request.json()`` / ``json.loads(bytes)`` imposent UTF-8 ; un client qui envoie
+    du JSON en Latin-1 ou cp1252 (octet 0xe9 pour « é », etc.) déclenche alors
+    UnicodeDecodeError côté serveur. On essaie UTF-8, puis cp1252, puis Latin-1.
+    """
+    if not raw:
+        raise json.JSONDecodeError("Expecting value", "", 0)
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return json.loads(raw.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+    try:
+        return json.loads(raw.decode("cp1252"))
+    except UnicodeDecodeError:
+        return json.loads(raw.decode("latin-1"))
+
+
 def fix_chat_messages(messages: list[Any]) -> list[Any]:
     """Aplatit le content ``assistant`` en chaîne (évite input_text sur les tours assistant)."""
     out: list[Any] = []
@@ -249,12 +270,14 @@ async def chat_completions(request: Request):
     raw = await request.body()
     stream = False
     try:
-        data = json.loads(raw)
+        data = parse_json_body(raw)
+        if not isinstance(data, dict):
+            raise TypeError("chat completion body must be a JSON object")
         stream = bool(data.get("stream"))
         if isinstance(data.get("messages"), list):
             data["messages"] = fix_chat_messages(data["messages"])
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
         pass
 
     return await proxy_upstream(
@@ -267,8 +290,11 @@ async def responses(request: Request):
     raw = await request.body()
     stream = False
     try:
-        stream = bool(json.loads(raw).get("stream"))
-    except (json.JSONDecodeError, TypeError):
+        data = parse_json_body(raw)
+        if isinstance(data, dict):
+            stream = bool(data.get("stream"))
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
         pass
 
     return await proxy_upstream(
