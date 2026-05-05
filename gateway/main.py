@@ -139,13 +139,18 @@ app = FastAPI(title="codex-to-api chat gateway", version="2.0.0", lifespan=lifes
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _mojibake_score(s: str) -> int:
+    """Heuristique : UTF-8 lu comme cp1252/latin-1 produit souvent « Ã », « Â », etc."""
+    return s.count("Ã") + s.count("Â") + s.count("â€")
+
+
 def parse_json_body(raw: bytes) -> Any:
     """
     Parse un corps JSON en acceptant des encodages clients incorrects.
 
-    ``request.json()`` / ``json.loads(bytes)`` imposent UTF-8 ; un client qui envoie
-    du JSON en Latin-1 ou cp1252 (octet 0xe9 pour « é », etc.) déclenche alors
-    UnicodeDecodeError côté serveur. On essaie UTF-8, puis cp1252, puis Latin-1.
+    UTF-8 strict d’abord. Si échec : ne pas décoder tout le buffer en Latin-1 (cela
+    casse l’UTF-8 valide : « ç » → « Ã§ », « très » → « trÃ¨s »). On essaie plusieurs
+    décodages puis on retient le parse JSON avec le moins de mojibake / de ``\\ufffd``.
     """
     if not raw:
         raise json.JSONDecodeError("Expecting value", "", 0)
@@ -154,10 +159,28 @@ def parse_json_body(raw: bytes) -> Any:
             return json.loads(raw.decode(encoding))
         except UnicodeDecodeError:
             continue
-    try:
-        return json.loads(raw.decode("cp1252"))
-    except UnicodeDecodeError:
-        return json.loads(raw.decode("latin-1"))
+        except json.JSONDecodeError:
+            raise
+
+    decoders = (
+        lambda b: b.decode("utf-8", errors="replace"),
+        lambda b: b.decode("cp1252"),
+        lambda b: b.decode("iso-8859-1"),
+    )
+    candidates: list[tuple[int, int, Any]] = []
+    for dec in decoders:
+        try:
+            text = dec(raw)
+            obj = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        candidates.append((_mojibake_score(text), text.count("\ufffd"), obj))
+
+    if not candidates:
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    return candidates[0][2]
 
 
 def strip_upstream_unsupported(d: dict[str, Any], *, chat: bool) -> None:
